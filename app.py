@@ -21,8 +21,52 @@ AG_PASSWORD = os.getenv("AG_PASSWORD")
 REPORTER_PASS = os.getenv("REPORTER_PASSWORD")
 REVIEWER_PASS = os.getenv("REVIEWER_PASSWORD")
 
+# --- HTTPS / TLS settings -------------------------------------------------
+# Certificate + key used when Flask serves TLS itself (python app.py).
+TLS_CERT_FILE = os.getenv("TLS_CERT_FILE")
+TLS_KEY_FILE = os.getenv("TLS_KEY_FILE")
+# Set to 1 when running behind a TLS-terminating reverse proxy (nginx, Render, ...)
+# so the X-Forwarded-Proto header is trusted to detect HTTPS.
+TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
+# Optional CA bundle for verifying upstream servers (e.g. a self-signed AllegroGraph cert).
+# Certificate verification is always on; this only changes which CAs are trusted.
+UPSTREAM_CA_BUNDLE = os.getenv("UPSTREAM_CA_BUNDLE") or True
+
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
+
+if TRUST_PROXY:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Session cookie is only ever sent over HTTPS and is not readable from JS
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    PREFERRED_URL_SCHEME="https",
+)
+
+
+@app.before_request
+def enforce_https():
+    """Redirect any plain-HTTP request to HTTPS (308 keeps POST bodies intact)."""
+    if not request.is_secure:
+        return redirect(request.url.replace("http://", "https://", 1), code=308)
+
+
+@app.after_request
+def set_security_headers(response):
+    # Tell browsers to only ever use HTTPS for this site
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+def require_https(url, service_name):
+    """Refuse to talk to an upstream service over anything other than HTTPS."""
+    if not url or not url.lower().startswith("https://"):
+        raise ValueError(f"{service_name} URL must use https:// (got: {url!r})")
+    return url
 
 CSV_FILE = "reports.csv"
 CSV_HEADERS = list(SCHEMA.keys())
@@ -191,6 +235,10 @@ def convert_and_upload_allegrograph():
 
     # Clean up the base URL in case '/webview' was accidentally included in the .env
     base_url = AG_BASE_URL.replace("/webview", "").rstrip("/")
+    try:
+        require_https(base_url, "AllegroGraph")
+    except ValueError as e:
+        return jsonify({"success": False, "message": str(e)}), 500
     data_url = f"{base_url}/repositories/{AG_REPO}/statements"
 
     try:
@@ -200,8 +248,13 @@ def convert_and_upload_allegrograph():
         headers = {"Content-Type": "text/turtle"}
         auth = HTTPBasicAuth(AG_USER, AG_PASSWORD)
         
-        # Allegrograph uses POST to /statements for inserting new data
-        resp = requests.post(data_url, data=ttl_data, headers=headers, auth=auth, timeout=20)
+        # Allegrograph uses POST to /statements for inserting new data.
+        # verify: TLS certificate is always checked. allow_redirects=False so a
+        # redirect can never silently downgrade the upload (and credentials) to HTTP.
+        resp = requests.post(
+            data_url, data=ttl_data, headers=headers, auth=auth, timeout=20,
+            verify=UPSTREAM_CA_BUNDLE, allow_redirects=False,
+        )
 
         if resp.status_code not in (200, 201, 204):
             return jsonify({
@@ -218,4 +271,10 @@ def convert_and_upload_allegrograph():
     return jsonify({"success": True, "message": "Data converted and uploaded to AllegroGraph successfully."})
 
 if __name__ == "__main__":
-    app.run(debug=False)
+    if TLS_CERT_FILE and TLS_KEY_FILE:
+        ssl_context = (TLS_CERT_FILE, TLS_KEY_FILE)
+    else:
+        # Local development only: throwaway self-signed cert (needs the 'cryptography' package).
+        print("WARNING: TLS_CERT_FILE/TLS_KEY_FILE not set, using a temporary self-signed certificate.")
+        ssl_context = "adhoc"
+    app.run(debug=False, ssl_context=ssl_context)
